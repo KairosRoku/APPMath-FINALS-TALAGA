@@ -1,0 +1,225 @@
+// PhysicsCompute.compute
+// All entity physics and AABB tile collision run here — zero Unity Physics.
+#pragma kernel CSPhysics
+#pragma kernel CSBuildTileMatrices
+
+// ─────────────────────────────────────────────
+// Shared structs
+// ─────────────────────────────────────────────
+struct EntityState
+{
+    float2 position;    // world-space center
+    float2 velocity;
+    float2 size;        // half-extents (width/2, height/2)
+    float  jumpBuffer;  // seconds remaining in jump buffer
+    int    onGround;    // 0 or 1
+    float  coyoteTime;  // seconds remaining after walking off edge
+    int    pad;
+};
+
+// ─────────────────────────────────────────────
+// Buffers & uniforms
+// ─────────────────────────────────────────────
+RWStructuredBuffer<EntityState> EntityBuffer;
+RWStructuredBuffer<float4x4>    EntityMatrixBuffer;
+
+// Tile grid: 1 = solid, 0 = empty
+StructuredBuffer<int>           TileBuffer;
+RWStructuredBuffer<float4x4>    TileMatrixBuffer;
+
+// Tile grid info
+int   GridWidth;
+int   GridHeight;
+float TileSize;         // world units per tile
+float2 GridOrigin;      // world position of tile (0,0) center
+
+// Physics constants
+float Gravity;          // e.g. 20.0  (positive, applied downward)
+float JumpForce;        // e.g. 9.0
+float MoveSpeed;        // e.g. 7.0
+float Friction;         // e.g. 18.0  (deceleration when no input)
+float Acceleration;     // e.g. 22.0
+float DeltaTime;
+float MaxFallSpeed;     // e.g. 30.0
+float JumpBufferTime;   // e.g. 0.12
+float CoyoteTimeDur;    // e.g. 0.12
+
+// Per-entity input (one entity per element right now)
+StructuredBuffer<float4> InputBuffer; // xy = moveDir, z = jumpPressed(1/0)
+
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+
+bool TileIsSolidAt(int tx, int ty)
+{
+    if (tx < 0 || tx >= GridWidth || ty < 0 || ty >= GridHeight) return false;
+    return TileBuffer[ty * GridWidth + tx] == 1;
+}
+
+// World position → tile index (returns false if out of bounds)
+bool WorldToTile(float2 worldPos, out int tx, out int ty)
+{
+    float2 local = worldPos - GridOrigin + float2(TileSize * 0.5, TileSize * 0.5);
+    tx = (int)floor(local.x / TileSize);
+    ty = (int)floor(local.y / TileSize);
+    return (tx >= 0 && tx < GridWidth && ty >= 0 && ty < GridHeight);
+}
+
+float2 TileCenter(int tx, int ty)
+{
+    return GridOrigin + float2(tx * TileSize, ty * TileSize);
+}
+
+// Build a TRS matrix for a 2D quad (Z = 0 plane)
+float4x4 TRS2D(float2 pos, float2 scale)
+{
+    return float4x4(
+        scale.x, 0,       0, pos.x,
+        0,       scale.y, 0, pos.y,
+        0,       0,       1, 0,
+        0,       0,       0, 1
+    );
+}
+
+// ─────────────────────────────────────────────
+// Kernel: Physics (one thread per entity)
+// ─────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSPhysics(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+
+    EntityState e = EntityBuffer[idx];
+    float4 input  = InputBuffer[idx];
+    float  moveX  = input.x;
+    bool   wantJump = input.z > 0.5;
+
+    // ── Horizontal movement ──────────────────
+    float targetVX = moveX * MoveSpeed;
+    if (abs(moveX) > 0.01)
+        e.velocity.x = lerp(e.velocity.x, targetVX, Acceleration * DeltaTime);
+    else
+        e.velocity.x = lerp(e.velocity.x, 0.0, Friction * DeltaTime);
+
+    // ── Gravity ──────────────────────────────
+    if (e.onGround == 0)
+        e.velocity.y -= Gravity * DeltaTime;
+    e.velocity.y = max(e.velocity.y, -MaxFallSpeed);
+
+    // ── Jump buffering ────────────────────────
+    if (wantJump) e.jumpBuffer = JumpBufferTime;
+    else          e.jumpBuffer = max(0.0, e.jumpBuffer - DeltaTime);
+
+    // ── Coyote time ───────────────────────────
+    if (e.onGround == 1) e.coyoteTime = CoyoteTimeDur;
+    else                 e.coyoteTime = max(0.0, e.coyoteTime - DeltaTime);
+
+    // ── Jump execution ────────────────────────
+    if (e.jumpBuffer > 0.0 && e.coyoteTime > 0.0)
+    {
+        e.velocity.y  = JumpForce;
+        e.jumpBuffer  = 0.0;
+        e.coyoteTime  = 0.0;
+        e.onGround    = 0;
+    }
+
+    // ── Integrate position ────────────────────
+    e.position += e.velocity * DeltaTime;
+
+    // ── AABB vs Tilemap collision ─────────────
+    // Skin inset so we don't falsely detect diagonal tiles
+    float skinX = e.size.x * 0.95;
+    float skinY = e.size.y * 0.95;
+
+    e.onGround = 0;
+
+    // ── Vertical resolution ──
+    // Test feet (bottom center-left and center-right)
+    float2 feetL = e.position + float2(-skinX, -e.size.y);
+    float2 feetR = e.position + float2( skinX, -e.size.y);
+    float2 headL = e.position + float2(-skinX,  e.size.y);
+    float2 headR = e.position + float2( skinX,  e.size.y);
+
+    // Bottom collision
+    int txL, tyL, txR, tyR;
+    WorldToTile(feetL, txL, tyL);
+    WorldToTile(feetR, txR, tyR);
+    if (TileIsSolidAt(txL, tyL) || TileIsSolidAt(txR, tyR))
+    {
+        // Push up to top of tile
+        int tySnap = tyL; // both should be same row
+        float tileTop = TileCenter(txL, tySnap).y + TileSize * 0.5;
+        e.position.y  = tileTop + e.size.y;
+        e.velocity.y  = max(0.0, e.velocity.y);
+        e.onGround    = 1;
+    }
+
+    // Top collision
+    WorldToTile(headL, txL, tyL);
+    WorldToTile(headR, txR, tyR);
+    if (TileIsSolidAt(txL, tyL) || TileIsSolidAt(txR, tyR))
+    {
+        int tySnap = tyL;
+        float tileBot = TileCenter(txL, tySnap).y - TileSize * 0.5;
+        e.position.y  = tileBot - e.size.y;
+        e.velocity.y  = min(0.0, e.velocity.y);
+    }
+
+    // ── Horizontal resolution ──
+    float2 rightT = e.position + float2( e.size.x,  skinY);
+    float2 rightB = e.position + float2( e.size.x, -skinY);
+    float2 leftT  = e.position + float2(-e.size.x,  skinY);
+    float2 leftB  = e.position + float2(-e.size.x, -skinY);
+
+    int txT, tyT, txB, tyB;
+
+    // Right wall
+    WorldToTile(rightT, txT, tyT);
+    WorldToTile(rightB, txB, tyB);
+    if (TileIsSolidAt(txT, tyT) || TileIsSolidAt(txB, tyB))
+    {
+        int txSnap = txT;
+        float tileLeft = TileCenter(txSnap, tyT).x - TileSize * 0.5;
+        e.position.x   = tileLeft - e.size.x;
+        e.velocity.x   = min(0.0, e.velocity.x);
+    }
+
+    // Left wall
+    WorldToTile(leftT, txT, tyT);
+    WorldToTile(leftB, txB, tyB);
+    if (TileIsSolidAt(txT, tyT) || TileIsSolidAt(txB, tyB))
+    {
+        int txSnap = txT;
+        float tileRight = TileCenter(txSnap, tyT).x + TileSize * 0.5;
+        e.position.x    = tileRight + e.size.x;
+        e.velocity.x    = max(0.0, e.velocity.x);
+    }
+
+    // ── Write back ────────────────────────────
+    EntityBuffer[idx]       = e;
+    EntityMatrixBuffer[idx] = TRS2D(e.position, e.size * 2.0);
+}
+
+// ─────────────────────────────────────────────
+// Kernel: Build tile matrices (dispatch once at startup & on level change)
+// ─────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSBuildTileMatrices(uint3 id : SV_DispatchThreadID)
+{
+    uint idx = id.x;
+    uint total = (uint)(GridWidth * GridHeight);
+    if (idx >= total) return;
+
+    int tx = (int)(idx % (uint)GridWidth);
+    int ty = (int)(idx / (uint)GridWidth);
+
+    float2 center = TileCenter(tx, ty);
+    float2 scale  = float2(TileSize, TileSize);
+
+    // Solid tile → valid matrix; empty → zero matrix (degenerate, invisible)
+    if (TileBuffer[idx] == 1)
+        TileMatrixBuffer[idx] = TRS2D(center, scale);
+    else
+        TileMatrixBuffer[idx] = (float4x4)0;
+}
